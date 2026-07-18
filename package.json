@@ -1,0 +1,14 @@
+{
+  "name": "kalshi-btc-backtest",
+  "version": "1.0.0",
+  "description": "Backtests BTC 15-min Kalshi markets against a rule-based entry/exit system",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0",
+    "cors": "^2.8.5"
+  }
+}
