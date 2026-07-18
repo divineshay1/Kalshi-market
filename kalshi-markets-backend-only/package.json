@@ -1,0 +1,15 @@
+{
+  "name": "kalshi-markets-backend",
+  "version": "0.1.0",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "pull-history": "node scripts/pullHistory.js",
+    "fill-spot": "node scripts/fillSpotPrices.js",
+    "build-dataset": "node scripts/pullHistory.js $npm_config_symbol && node scripts/fillSpotPrices.js $npm_config_symbol"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
