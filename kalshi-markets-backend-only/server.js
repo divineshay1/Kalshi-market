@@ -563,4 +563,8 @@ setInterval(refreshSports, 45000);
 });
 
 const PORT = process.env.PORT || 3001;
+<<<<<<< HEAD
 app.listen(PORT, () => console.log(`kalshi-markets running on :${PORT}`));
+=======
+app.listen(PORT, () => console.log(`kalshi-markets running on :${PORT}`));
+>>>>>>> 6530e1f9b8e1f0284e9322c0fcc608618384d9de
