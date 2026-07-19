@@ -20,12 +20,22 @@ const KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2";
 const COINBASE_BASE = "https://api.coinbase.com/v2";
 
 // ---------- MARKET CONFIG ----------
+// gapMin/winProbRange/payoutMin for BTC came from a full walk-forward
+// backtest that held up across out-of-sample folds - status "validated"
+// means it's trusted for live trade signals.
+//
+// DOGE and SOL below use the best params found by the same walk-forward
+// process, but they only held up in the earliest fold (out-of-sample trade
+// counts got too thin in later folds to confirm consistency) - so status
+// stays "candidate", not "validated". The signal still computes and shows
+// on the dashboard (marked "unvalidated"), but isLiveEligible() below keeps
+// them out of live/tradeable status until more data confirms the edge.
 const MARKETS = {
   BTC: { label: "Bitcoin 15m", kalshiSeries: "KXBTC15M", coinbasePair: "BTC-USD", gapMin: 8, winProbRange: [0.55, 0.65], payoutMin: 1.2, status: "validated" },
-  DOGE: { label: "Dogecoin 15m", kalshiSeries: "KXDOGE15M", coinbasePair: "DOGE-USD", gapMin: null, winProbRange: [0.55, 0.65], payoutMin: 1.2, status: "candidate" },
-  SOL: { label: "Solana 15m", kalshiSeries: "KXSOL15M", coinbasePair: "SOL-USD", gapMin: null, winProbRange: [0.55, 0.65], payoutMin: 1.2, status: "candidate" },
-  ETH: { label: "Ethereum 15m", kalshiSeries: "KXETH15M", coinbasePair: "ETH-USD", gapMin: null, winProbRange: [0.55, 0.65], payoutMin: 1.2, status: "candidate" },
-  HYPE: { label: "Hyperliquid 15m", kalshiSeries: "KXHYPE15M", coinbasePair: "HYPE-USD", gapMin: null, winProbRange: [0.55, 0.65], payoutMin: 1.2, status: "candidate" },
+  DOGE: { label: "Dogecoin 15m", kalshiSeries: "KXDOGE15M", coinbasePair: "DOGE-USD", gapMin: 0.00017, winProbRange: [0.55, 0.65], payoutMin: 1.1, status: "candidate" },
+  SOL: { label: "Solana 15m", kalshiSeries: "KXSOL15M", coinbasePair: "SOL-USD", gapMin: 0.083, winProbRange: [0.5, 0.6], payoutMin: 1.1, status: "candidate" },
+  ETH: { label: "Ethereum 15m", kalshiSeries: "KXETH15M", coinbasePair: "ETH-USD", gapMin: 1.67, winProbRange: [0.5, 0.6], payoutMin: 1.1, status: "candidate" },
+  HYPE: { label: "Hyperliquid 15m", kalshiSeries: "KXHYPE15M", coinbasePair: "HYPE-USD", gapMin: 0.107, winProbRange: [0.5, 0.6], payoutMin: 1.1, status: "candidate" },
 };
 function isLiveEligible(symbol) { return MARKETS[symbol]?.status === "validated"; }
 
@@ -238,6 +248,8 @@ h1 { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 3r
 .label { color: #a98a95; font-size: 11px; text-transform: uppercase; letter-spacing: 0.15em; }
 .signal { display: inline-block; margin-top: 10px; padding: 4px 10px; border-radius: 3px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.15em; border: 1px solid rgba(201,161,90,0.4); color: #c9a15a; }
 .signal.hold { color: #c98ba0; border-color: rgba(201,139,160,0.35); }
+.signal.unvalidated { color: #c98ba0; border-color: rgba(201,139,160,0.4); border-style: dashed; }
+.unvalidated-note { display: block; margin-top: 6px; font-size: 9px; text-transform: uppercase; letter-spacing: 0.12em; color: #8a6b74; }
 .stats { display: flex; justify-content: space-between; margin-top: 14px; font-family: 'JetBrains Mono', monospace; font-size: 13px; color: #f5ead9; }
 .stat-label { color: #8a6b74; font-size: 9px; text-transform: uppercase; display: block; }
 h2 { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 2rem; margin: 40px 0 8px; }
@@ -291,9 +303,13 @@ async function refresh() {
     el.innerHTML = Object.values(data).map(m => {
       if (m.error) return '<div class="card"><div class="symbol">' + m.symbol + '</div><div class="label">Error: ' + m.error + '</div></div>';
       const isPaper = m.mode === 'paper-only';
+      const hasSignal = m.signal && m.signal !== 'PAPER_ONLY';
+      const signalClass = m.signal === 'HOLD' ? 'hold' : (isPaper && hasSignal ? 'unvalidated' : '');
+      const signalText = hasSignal ? m.signal.replace('_',' ') : 'No signal yet';
       return '<div class="card ' + (isPaper ? 'paper' : '') + '">' +
         '<div class="symbol">' + m.symbol + '</div>' +
-        '<div class="signal ' + (m.signal === 'HOLD' ? 'hold' : '') + '">' + (isPaper ? 'Paper only' : m.signal.replace('_',' ')) + '</div>' +
+        '<div class="signal ' + signalClass + '">' + signalText + '</div>' +
+        (isPaper && hasSignal ? '<div class="unvalidated-note">Unvalidated backtest - not live-tradeable</div>' : '') +
         '<div class="stats">' +
           '<div><span class="stat-label">Price</span>$' + Number(m.spotPrice).toFixed(m.spotPrice < 1 ? 4 : 2) + '</div>' +
           '<div><span class="stat-label">Prob</span>' + (m.impliedProb*100).toFixed(0) + '%</div>' +
