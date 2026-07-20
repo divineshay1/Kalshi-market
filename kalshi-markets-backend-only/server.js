@@ -250,6 +250,12 @@ h1 { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 3r
 .signal.hold { color: #c98ba0; border-color: rgba(201,139,160,0.35); }
 .signal.unvalidated { color: #c98ba0; border-color: rgba(201,139,160,0.4); border-style: dashed; }
 .unvalidated-note { display: block; margin-top: 6px; font-size: 9px; text-transform: uppercase; letter-spacing: 0.12em; color: #8a6b74; }
+.position { margin-top: 12px; padding: 6px 10px; border-radius: 3px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600; }
+.position-yes { background: rgba(201,161,90,0.15); color: #c9a15a; border: 1px solid rgba(201,161,90,0.4); }
+.position-no { background: rgba(201,139,160,0.15); color: #c98ba0; border: 1px solid rgba(201,139,160,0.4); }
+.position-actions { display: flex; gap: 6px; margin-top: 8px; }
+.position-actions button { flex: 1; background: #1a0f13; border: 1px solid rgba(201,161,90,0.3); color: #f5ead9; padding: 6px 8px; border-radius: 3px; font-family: 'Work Sans', sans-serif; font-size: 11px; cursor: pointer; }
+.position-actions button:hover { border-color: #c9a15a; }
 .stats { display: flex; justify-content: space-between; margin-top: 14px; font-family: 'JetBrains Mono', monospace; font-size: 13px; color: #f5ead9; }
 .stat-label { color: #8a6b74; font-size: 9px; text-transform: uppercase; display: block; }
 h2 { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 2rem; margin: 40px 0 8px; }
@@ -295,6 +301,39 @@ footer { margin-top: 32px; font-size: 10px; text-transform: uppercase; letter-sp
   <footer>Educational tooling - not financial advice - signals are probabilistic, never certain</footer>
 </div>
 <script>
+// --- Trade log (localStorage, per-browser) ---
+// Position tracking lives here too: a "pending" log entry for a symbol IS
+// that symbol's open position. It's what lets the dashboard tell you what
+// you're currently holding even after closing the tab and coming back -
+// nothing server-side, just this browser's localStorage.
+function getLog() { return JSON.parse(localStorage.getItem('tradeLog') || '[]'); }
+function saveLog(log) { localStorage.setItem('tradeLog', JSON.stringify(log)); }
+function currentPosition(symbol) {
+  return getLog().find(t => t.symbol === symbol && t.result === 'pending') || null;
+}
+function enterPosition(symbol, signal) {
+  if (currentPosition(symbol)) return; // one open position per symbol at a time
+  const log = getLog();
+  log.unshift({ symbol, signal, result: 'pending', time: new Date().toLocaleString() });
+  saveLog(log);
+  refresh();
+  renderLog();
+}
+function closePosition(symbol, result) {
+  const log = getLog();
+  const idx = log.findIndex(t => t.symbol === symbol && t.result === 'pending');
+  if (idx === -1) return;
+  log[idx].result = result;
+  saveLog(log);
+  refresh();
+  renderLog();
+}
+function logTrade() {
+  const symbol = document.getElementById('logSymbol').value;
+  const signal = document.getElementById('logSignal').value;
+  enterPosition(symbol, signal);
+}
+
 async function refresh() {
   try {
     const res = await fetch('/api/live-status');
@@ -306,10 +345,24 @@ async function refresh() {
       const hasSignal = m.signal && m.signal !== 'PAPER_ONLY';
       const signalClass = m.signal === 'HOLD' ? 'hold' : (isPaper && hasSignal ? 'unvalidated' : '');
       const signalText = hasSignal ? m.signal.replace('_',' ') : 'No signal yet';
+      const pos = currentPosition(m.symbol);
+      const posHtml = pos
+        ? '<div class="position position-' + (pos.signal === 'BUY_YES' ? 'yes' : 'no') + '">' +
+            'Your position: ' + (pos.signal === 'BUY_YES' ? 'HOLDING UP (YES) ▲' : 'HOLDING DOWN (NO) ▼') +
+          '</div>' +
+          '<div class="position-actions">' +
+            '<button onclick="closePosition(\\'' + m.symbol + '\\',\\'win\\')">Won</button>' +
+            '<button onclick="closePosition(\\'' + m.symbol + '\\',\\'loss\\')">Lost</button>' +
+          '</div>'
+        : '<div class="position-actions">' +
+            '<button onclick="enterPosition(\\'' + m.symbol + '\\',\\'BUY_YES\\')">Enter YES</button>' +
+            '<button onclick="enterPosition(\\'' + m.symbol + '\\',\\'BUY_NO\\')">Enter NO</button>' +
+          '</div>';
       return '<div class="card ' + (isPaper ? 'paper' : '') + '">' +
         '<div class="symbol">' + m.symbol + '</div>' +
         '<div class="signal ' + signalClass + '">' + signalText + '</div>' +
         (isPaper && hasSignal ? '<div class="unvalidated-note">Unvalidated backtest - not live-tradeable</div>' : '') +
+        posHtml +
         '<div class="stats">' +
           '<div><span class="stat-label">Price</span>$' + Number(m.spotPrice).toFixed(m.spotPrice < 1 ? 4 : 2) + '</div>' +
           '<div><span class="stat-label">Prob</span>' + (m.impliedProb*100).toFixed(0) + '%</div>' +
@@ -321,18 +374,6 @@ async function refresh() {
 }
 refresh();
 setInterval(refresh, 20000);
-
-// --- Trade log (localStorage, per-browser) ---
-function getLog() { return JSON.parse(localStorage.getItem('tradeLog') || '[]'); }
-function saveLog(log) { localStorage.setItem('tradeLog', JSON.stringify(log)); }
-function logTrade() {
-  const symbol = document.getElementById('logSymbol').value;
-  const signal = document.getElementById('logSignal').value;
-  const log = getLog();
-  log.unshift({ symbol, signal, result: 'pending', time: new Date().toLocaleString() });
-  saveLog(log);
-  renderLog();
-}
 function setResult(index, result) {
   const log = getLog();
   log[index].result = result;
