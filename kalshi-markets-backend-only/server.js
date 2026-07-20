@@ -46,11 +46,17 @@ const SPORTS = {
 };
 
 // ---------- SCANNER ----------
+// "lean" is the raw directional read (is spot above or below strike right
+// now) - always computed, shown even when the strict entry rules below
+// say HOLD. It's not a vetted trade call, just "which way is it pointing."
+// "signal" (HOLD / BUY_YES / BUY_NO) stays gated by gap/prob/payout
+// thresholds - that distinction is intentional, don't collapse them.
 function evaluateEntry({ symbol, spotPrice, strike, impliedProb, payout }) {
   const cfg = MARKETS[symbol];
-  if (!cfg) return { signal: "STAND_ASIDE", reasons: [`Unknown market: ${symbol}`] };
+  const lean = (spotPrice != null && strike != null) ? (spotPrice > strike ? "UP" : "DOWN") : null;
+  if (!cfg) return { signal: "STAND_ASIDE", reasons: [`Unknown market: ${symbol}`], lean };
   if (cfg.gapMin === null) {
-    return { signal: "PAPER_ONLY", reasons: [`${cfg.label} has no validated rule set yet.`], mode: "paper-only" };
+    return { signal: "PAPER_ONLY", reasons: [`${cfg.label} has no validated rule set yet.`], mode: "paper-only", lean };
   }
   const gap = Math.abs(spotPrice - strike);
   const reasons = [];
@@ -59,8 +65,8 @@ function evaluateEntry({ symbol, spotPrice, strike, impliedProb, payout }) {
   const [loP, hiP] = cfg.winProbRange;
   if (impliedProb < loP || impliedProb > hiP) { pass = false; reasons.push(`Win prob ${(impliedProb*100).toFixed(1)}% outside window.`); }
   if (payout < cfg.payoutMin) { pass = false; reasons.push(`Payout ${payout.toFixed(2)}x below min.`); }
-  if (!pass) return { signal: "HOLD", reasons, mode: isLiveEligible(symbol) ? "live" : "paper-only" };
-  return { signal: spotPrice > strike ? "BUY_YES" : "BUY_NO", reasons: ["All entry conditions met."], mode: isLiveEligible(symbol) ? "live" : "paper-only" };
+  if (!pass) return { signal: "HOLD", reasons, mode: isLiveEligible(symbol) ? "live" : "paper-only", lean };
+  return { signal: spotPrice > strike ? "BUY_YES" : "BUY_NO", reasons: ["All entry conditions met."], mode: isLiveEligible(symbol) ? "live" : "paper-only", lean };
 }
 
 // ---------- GUARDRAILS ----------
@@ -137,6 +143,25 @@ function walkForwardValidate(history, { folds = 4, minTradesPerFold = 20 } = {})
 
 // ---------- LIVE POLLER ----------
 const liveState = {};
+
+// Rolling spot-price window per symbol, used only to flag "volatile right
+// now" - not a signal on its own, just a heads-up for someone already
+// holding a position. Threshold is 3x the market's own calibrated
+// gapMin (same number the entry rules already use), not an arbitrary
+// guess - so a market's volatility bar scales with its own price/tick
+// behavior instead of one fixed number for every asset.
+const priceHistory = {};
+const VOLATILITY_WINDOW = 5; // last 5 poll ticks (~100s at a 20s poll interval)
+function trackVolatility(symbol, spotPrice) {
+  const hist = (priceHistory[symbol] = priceHistory[symbol] || []);
+  hist.push(spotPrice);
+  if (hist.length > VOLATILITY_WINDOW) hist.shift();
+  if (hist.length < VOLATILITY_WINDOW) return { priceRange: null, highVolatility: false };
+  const range = Math.max(...hist) - Math.min(...hist);
+  const cfg = MARKETS[symbol];
+  const threshold = cfg && cfg.gapMin ? cfg.gapMin * 3 : null;
+  return { priceRange: range, highVolatility: threshold != null && range > threshold };
+}
 async function pollMarket(symbol) {
   const cfg = MARKETS[symbol];
   try {
@@ -157,9 +182,11 @@ async function pollMarket(symbol) {
     const strike = market.floor_strike ?? market.cap_strike ?? spotPrice;
     const impliedProb = parseFloat(market.last_price_dollars || market.yes_bid_dollars || 0.5);
     const payout = impliedProb > 0 ? 1 / impliedProb : 1;
+    const closeTime = market.close_time || null;
 
     const evalResult = evaluateEntry({ symbol, spotPrice, strike, impliedProb, payout });
-    liveState[symbol] = { symbol, spotPrice, strike, impliedProb, payout, ...evalResult, updatedAt: Date.now() };
+    const volResult = trackVolatility(symbol, spotPrice);
+    liveState[symbol] = { symbol, spotPrice, strike, impliedProb, payout, closeTime, ...evalResult, ...volResult, updatedAt: Date.now() };
   } catch (err) {
     liveState[symbol] = { symbol, error: err.message, updatedAt: Date.now() };
   }
@@ -250,12 +277,19 @@ h1 { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 3r
 .signal.hold { color: #c98ba0; border-color: rgba(201,139,160,0.35); }
 .signal.unvalidated { color: #c98ba0; border-color: rgba(201,139,160,0.4); border-style: dashed; }
 .unvalidated-note { display: block; margin-top: 6px; font-size: 9px; text-transform: uppercase; letter-spacing: 0.12em; color: #8a6b74; }
+.lean { display: inline-block; margin-top: 8px; margin-left: 6px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600; }
+.lean-up { color: #c9a15a; }
+.lean-down { color: #c98ba0; }
+.countdown { display: block; margin-top: 6px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #a98a95; letter-spacing: 0.05em; }
+.reasons { margin: 10px 0 0; padding-left: 16px; font-size: 11px; color: #a98a95; line-height: 1.6; }
+.reasons li { margin-bottom: 2px; }
 .position { margin-top: 12px; padding: 6px 10px; border-radius: 3px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600; }
 .position-yes { background: rgba(201,161,90,0.15); color: #c9a15a; border: 1px solid rgba(201,161,90,0.4); }
 .position-no { background: rgba(201,139,160,0.15); color: #c98ba0; border: 1px solid rgba(201,139,160,0.4); }
 .position-actions { display: flex; gap: 6px; margin-top: 8px; }
 .position-actions button { flex: 1; background: #1a0f13; border: 1px solid rgba(201,161,90,0.3); color: #f5ead9; padding: 6px 8px; border-radius: 3px; font-family: 'Work Sans', sans-serif; font-size: 11px; cursor: pointer; }
 .position-actions button:hover { border-color: #c9a15a; }
+.volatility-warning { margin-top: 8px; padding: 6px 10px; border-radius: 3px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; background: rgba(217,119,87,0.15); color: #d97757; border: 1px solid rgba(217,119,87,0.4); }
 .stats { display: flex; justify-content: space-between; margin-top: 14px; font-family: 'JetBrains Mono', monospace; font-size: 13px; color: #f5ead9; }
 .stat-label { color: #8a6b74; font-size: 9px; text-transform: uppercase; display: block; }
 h2 { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 2rem; margin: 40px 0 8px; }
@@ -345,11 +379,24 @@ async function refresh() {
       const hasSignal = m.signal && m.signal !== 'PAPER_ONLY';
       const signalClass = m.signal === 'HOLD' ? 'hold' : (isPaper && hasSignal ? 'unvalidated' : '');
       const signalText = hasSignal ? m.signal.replace('_',' ') : 'No signal yet';
+      const leanHtml = m.lean
+        ? '<div class="lean lean-' + (m.lean === 'UP' ? 'up' : 'down') + '">Direction: ' + m.lean + (m.lean === 'UP' ? ' ▲' : ' ▼') + '</div>'
+        : '';
+      const countdownHtml = m.closeTime
+        ? '<div class="countdown" data-close="' + m.closeTime + '">Cycle closes in --:--</div>'
+        : '';
+      const reasonsHtml = (m.reasons && m.reasons.length)
+        ? '<ul class="reasons">' + m.reasons.map(r => '<li>' + r + '</li>').join('') + '</ul>'
+        : '';
       const pos = currentPosition(m.symbol);
+      const volatilityWarning = (pos && m.highVolatility)
+        ? '<div class="volatility-warning">Volatility spike - consider taking profit</div>'
+        : '';
       const posHtml = pos
         ? '<div class="position position-' + (pos.signal === 'BUY_YES' ? 'yes' : 'no') + '">' +
             'Your position: ' + (pos.signal === 'BUY_YES' ? 'HOLDING UP (YES) ▲' : 'HOLDING DOWN (NO) ▼') +
           '</div>' +
+          volatilityWarning +
           '<div class="position-actions">' +
             '<button onclick="closePosition(\\'' + m.symbol + '\\',\\'win\\')">Won</button>' +
             '<button onclick="closePosition(\\'' + m.symbol + '\\',\\'loss\\')">Lost</button>' +
@@ -361,7 +408,10 @@ async function refresh() {
       return '<div class="card ' + (isPaper ? 'paper' : '') + '">' +
         '<div class="symbol">' + m.symbol + '</div>' +
         '<div class="signal ' + signalClass + '">' + signalText + '</div>' +
+        leanHtml +
+        countdownHtml +
         (isPaper && hasSignal ? '<div class="unvalidated-note">Unvalidated backtest - not live-tradeable</div>' : '') +
+        reasonsHtml +
         posHtml +
         '<div class="stats">' +
           '<div><span class="stat-label">Price</span>$' + Number(m.spotPrice).toFixed(m.spotPrice < 1 ? 4 : 2) + '</div>' +
@@ -370,10 +420,23 @@ async function refresh() {
         '</div>' +
       '</div>';
     }).join('');
+    updateCountdowns();
   } catch (e) { console.error(e); }
+}
+function updateCountdowns() {
+  document.querySelectorAll('.countdown').forEach(el => {
+    const closeMs = new Date(el.dataset.close).getTime();
+    const remaining = Math.max(0, Math.floor((closeMs - Date.now()) / 1000));
+    const mm = Math.floor(remaining / 60);
+    const ss = remaining % 60;
+    el.textContent = remaining > 0
+      ? 'Cycle closes in ' + mm + ':' + String(ss).padStart(2, '0')
+      : 'Cycle closed - refreshing...';
+  });
 }
 refresh();
 setInterval(refresh, 20000);
+setInterval(updateCountdowns, 1000);
 function setResult(index, result) {
   const log = getLog();
   log[index].result = result;
