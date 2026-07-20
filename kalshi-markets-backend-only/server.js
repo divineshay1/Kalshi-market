@@ -183,10 +183,11 @@ async function pollMarket(symbol) {
     const impliedProb = parseFloat(market.last_price_dollars || market.yes_bid_dollars || 0.5);
     const payout = impliedProb > 0 ? 1 / impliedProb : 1;
     const closeTime = market.close_time || null;
+    const ticker = market.ticker || null;
 
     const evalResult = evaluateEntry({ symbol, spotPrice, strike, impliedProb, payout });
     const volResult = trackVolatility(symbol, spotPrice);
-    liveState[symbol] = { symbol, spotPrice, strike, impliedProb, payout, closeTime, ...evalResult, ...volResult, updatedAt: Date.now() };
+    liveState[symbol] = { symbol, spotPrice, strike, impliedProb, payout, closeTime, ticker, ...evalResult, ...volResult, updatedAt: Date.now() };
   } catch (err) {
     liveState[symbol] = { symbol, error: err.message, updatedAt: Date.now() };
   }
@@ -227,6 +228,20 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 app.get("/api/markets", (req, res) => res.json(MARKETS));
 app.get("/api/sports", (req, res) => res.json(SPORTS));
 app.get("/api/live-status", (req, res) => res.json(liveState));
+// Looks up a specific closed contract's real outcome, so a position the
+// dashboard tracked can be auto-settled against what Kalshi actually
+// resolved - not a guess, the market's own final result.
+app.get("/api/settlement/:ticker", async (req, res) => {
+  try {
+    const r = await fetch(`${KALSHI_BASE}/markets/${req.params.ticker}`);
+    if (!r.ok) return res.status(502).json({ error: `Kalshi ${r.status}` });
+    const data = await r.json();
+    const market = data.market || data;
+    res.json({ ticker: req.params.ticker, status: market.status, result: market.result || null });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
 app.post("/api/scan", (req, res) => res.json(evaluateEntry(req.body)));
 app.post("/api/discover-strategy", (req, res) => {
   const { symbol, history } = req.body;
@@ -286,6 +301,7 @@ h1 { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 3r
 .position { margin-top: 12px; padding: 6px 10px; border-radius: 3px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600; }
 .position-yes { background: rgba(201,161,90,0.15); color: #c9a15a; border: 1px solid rgba(201,161,90,0.4); }
 .position-no { background: rgba(201,139,160,0.15); color: #c98ba0; border: 1px solid rgba(201,139,160,0.4); }
+.position-settling { opacity: 0.6; border-style: dashed; }
 .position-actions { display: flex; gap: 6px; margin-top: 8px; }
 .position-actions button { flex: 1; background: #1a0f13; border: 1px solid rgba(201,161,90,0.3); color: #f5ead9; padding: 6px 8px; border-radius: 3px; font-family: 'Work Sans', sans-serif; font-size: 11px; cursor: pointer; }
 .position-actions button:hover { border-color: #c9a15a; }
@@ -345,10 +361,10 @@ function saveLog(log) { localStorage.setItem('tradeLog', JSON.stringify(log)); }
 function currentPosition(symbol) {
   return getLog().find(t => t.symbol === symbol && t.result === 'pending') || null;
 }
-function enterPosition(symbol, signal) {
+function enterPosition(symbol, signal, ticker, closeTime) {
   if (currentPosition(symbol)) return; // one open position per symbol at a time
   const log = getLog();
-  log.unshift({ symbol, signal, result: 'pending', time: new Date().toLocaleString() });
+  log.unshift({ symbol, signal, result: 'pending', time: new Date().toLocaleString(), ticker: ticker || null, closeTime: closeTime || null });
   saveLog(log);
   refresh();
   renderLog();
@@ -361,6 +377,31 @@ function closePosition(symbol, result) {
   saveLog(log);
   refresh();
   renderLog();
+}
+// Auto-settles pending positions once their contract's cycle has closed,
+// by checking what Kalshi actually resolved - not a guess, the real
+// outcome. Runs alongside the normal poll cycle.
+async function checkSettlements() {
+  const log = getLog();
+  let changed = false;
+  for (const entry of log) {
+    if (entry.result !== 'pending' || !entry.ticker || !entry.closeTime) continue;
+    if (new Date(entry.closeTime).getTime() > Date.now()) continue; // cycle still open
+    try {
+      const res = await fetch('/api/settlement/' + encodeURIComponent(entry.ticker));
+      const data = await res.json();
+      if (data.result === 'yes' || data.result === 'no') {
+        const won = (entry.signal === 'BUY_YES' && data.result === 'yes') || (entry.signal === 'BUY_NO' && data.result === 'no');
+        entry.result = won ? 'win' : 'loss';
+        changed = true;
+      }
+    } catch (e) { console.error(e); }
+  }
+  if (changed) {
+    saveLog(log);
+    renderLog();
+    refresh();
+  }
 }
 function logTrade() {
   const symbol = document.getElementById('logSymbol').value;
@@ -389,12 +430,16 @@ async function refresh() {
         ? '<ul class="reasons">' + m.reasons.map(r => '<li>' + r + '</li>').join('') + '</ul>'
         : '';
       const pos = currentPosition(m.symbol);
-      const volatilityWarning = (pos && m.highVolatility)
+      const cycleEnded = !!(pos && pos.closeTime && new Date(pos.closeTime).getTime() <= Date.now());
+      const volatilityWarning = (pos && m.highVolatility && !cycleEnded)
         ? '<div class="volatility-warning">Volatility spike - consider taking profit</div>'
         : '';
+      const positionLabel = cycleEnded
+        ? 'Settling...'
+        : (pos && pos.signal === 'BUY_YES' ? 'HOLDING UP (YES) ▲' : 'HOLDING DOWN (NO) ▼');
       const posHtml = pos
-        ? '<div class="position position-' + (pos.signal === 'BUY_YES' ? 'yes' : 'no') + '">' +
-            'Your position: ' + (pos.signal === 'BUY_YES' ? 'HOLDING UP (YES) ▲' : 'HOLDING DOWN (NO) ▼') +
+        ? '<div class="position position-' + (pos.signal === 'BUY_YES' ? 'yes' : 'no') + (cycleEnded ? ' position-settling' : '') + '">' +
+            'Your position: ' + positionLabel +
           '</div>' +
           volatilityWarning +
           '<div class="position-actions">' +
@@ -402,8 +447,8 @@ async function refresh() {
             '<button onclick="closePosition(\\'' + m.symbol + '\\',\\'loss\\')">Lost</button>' +
           '</div>'
         : '<div class="position-actions">' +
-            '<button onclick="enterPosition(\\'' + m.symbol + '\\',\\'BUY_YES\\')">Enter YES</button>' +
-            '<button onclick="enterPosition(\\'' + m.symbol + '\\',\\'BUY_NO\\')">Enter NO</button>' +
+            '<button onclick="enterPosition(\\'' + m.symbol + '\\',\\'BUY_YES\\',\\'' + (m.ticker||'') + '\\',\\'' + (m.closeTime||'') + '\\')">Enter YES</button>' +
+            '<button onclick="enterPosition(\\'' + m.symbol + '\\',\\'BUY_NO\\',\\'' + (m.ticker||'') + '\\',\\'' + (m.closeTime||'') + '\\')">Enter NO</button>' +
           '</div>';
       return '<div class="card ' + (isPaper ? 'paper' : '') + '">' +
         '<div class="symbol">' + m.symbol + '</div>' +
@@ -435,7 +480,9 @@ function updateCountdowns() {
   });
 }
 refresh();
+checkSettlements();
 setInterval(refresh, 20000);
+setInterval(checkSettlements, 20000);
 setInterval(updateCountdowns, 1000);
 function setResult(index, result) {
   const log = getLog();
