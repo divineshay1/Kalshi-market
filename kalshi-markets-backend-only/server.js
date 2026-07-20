@@ -162,6 +162,65 @@ function trackVolatility(symbol, spotPrice) {
   const threshold = cfg && cfg.gapMin ? cfg.gapMin * 3 : null;
   return { priceRange: range, highVolatility: threshold != null && range > threshold };
 }
+
+// Longer rolling window, just for the dashboard's sparkline chart - separate
+// from the volatility window above so tightening/loosening one doesn't
+// silently change the other.
+const sparklineHistory = {};
+const SPARKLINE_WINDOW = 15; // last 15 poll ticks (~5 min at a 20s poll interval)
+function trackSparkline(symbol, spotPrice) {
+  const hist = (sparklineHistory[symbol] = sparklineHistory[symbol] || []);
+  hist.push(spotPrice);
+  if (hist.length > SPARKLINE_WINDOW) hist.shift();
+  return hist.slice();
+}
+
+// Rolling win-chance (impliedProb) window per symbol - tracks whether it's
+// still trending down, not just "below 50% right now" (a single low tick
+// could just be noise).
+const probHistory = {};
+const PROB_TREND_WINDOW = 3; // last 3 poll ticks (~60s)
+function trackProbTrend(symbol, impliedProb) {
+  const hist = (probHistory[symbol] = probHistory[symbol] || []);
+  hist.push(impliedProb);
+  if (hist.length > PROB_TREND_WINDOW) hist.shift();
+  if (hist.length < PROB_TREND_WINDOW) return { probFalling: false };
+  let falling = true;
+  for (let i = 1; i < hist.length; i++) {
+    if (hist[i] >= hist[i - 1]) { falling = false; break; }
+  }
+  return { probFalling: falling };
+}
+
+// ---------- EXIT ADVISOR ----------
+// Fixed, auditable hold/exit rules for a position you're already in -
+// not a live discretionary call, just deterministic logic:
+//   - win chance 80%+ -> the trade is essentially decided, don't
+//     second-guess a wobble
+//   - win chance under 50% AND still trending down (not just one noisy
+//     tick) -> the one real warning sign
+//   - gap still wide relative to this asset's own calibrated entry
+//     threshold -> a same-tick bounce against it is probably the "fake
+//     V-bounce" this rule set exists to ignore
+// "Wide" is 2x the asset's own gapMin, the same asset-scaling approach
+// used for the volatility threshold - not one fixed dollar number for
+// every asset's different price scale.
+function evaluateExit({ symbol, spotPrice, strike, impliedProb, probFalling }) {
+  const cfg = MARKETS[symbol];
+  const gap = Math.abs(spotPrice - strike);
+  const wideGapThreshold = cfg && cfg.gapMin ? cfg.gapMin * 2 : null;
+  if (impliedProb >= 0.8) {
+    return { exitAdvice: "LOCKED_IN", exitReason: `Win chance ${(impliedProb * 100).toFixed(0)}% - locked in, hold to payout.` };
+  }
+  if (impliedProb < 0.5 && probFalling) {
+    return { exitAdvice: "EXIT_WARNING", exitReason: `Win chance ${(impliedProb * 100).toFixed(0)}% and still falling - consider exiting.` };
+  }
+  if (wideGapThreshold != null && gap >= wideGapThreshold) {
+    return { exitAdvice: "HOLD_WIDE_GAP", exitReason: `Gap $${gap.toFixed(2)} still wide - hold through any bounce.` };
+  }
+  return { exitAdvice: "NEUTRAL", exitReason: null };
+}
+
 async function pollMarket(symbol) {
   const cfg = MARKETS[symbol];
   try {
@@ -187,7 +246,10 @@ async function pollMarket(symbol) {
 
     const evalResult = evaluateEntry({ symbol, spotPrice, strike, impliedProb, payout });
     const volResult = trackVolatility(symbol, spotPrice);
-    liveState[symbol] = { symbol, spotPrice, strike, impliedProb, payout, closeTime, ticker, ...evalResult, ...volResult, updatedAt: Date.now() };
+    const probTrend = trackProbTrend(symbol, impliedProb);
+    const exitResult = evaluateExit({ symbol, spotPrice, strike, impliedProb, probFalling: probTrend.probFalling });
+    const sparkline = trackSparkline(symbol, spotPrice);
+    liveState[symbol] = { symbol, spotPrice, strike, impliedProb, payout, closeTime, ticker, sparkline, ...evalResult, ...volResult, ...probTrend, ...exitResult, updatedAt: Date.now() };
   } catch (err) {
     liveState[symbol] = { symbol, error: err.message, updatedAt: Date.now() };
   }
@@ -197,12 +259,23 @@ pollAllMarkets();
 setInterval(pollAllMarkets, 20000);
 
 // ---------- WHALE SCANNER ----------
-async function detectWhales(ticker, { minContracts = 500 } = {}) {
+// Kalshi's real orderbook response is { orderbook_fp: { yes_dollars: [[price,size],...], no_dollars: [...] } } -
+// note this is NOT { orderbook: { yes, no } }, which is what this function
+// read before (silently returning nothing every time). Also switched from
+// a fixed contract-count threshold to top-N-by-size: a flat "500+
+// contracts" cutoff flags dozens of levels even far out-of-the-money on a
+// liquid market, and flags nothing on a thin one - doesn't scale.
+async function detectWhales(ticker, { topN = 3 } = {}) {
   const res = await fetch(`${KALSHI_BASE}/markets/${ticker}/orderbook`);
   if (!res.ok) throw new Error(`${res.status} fetching orderbook`);
   const data = await res.json();
-  const flagLevels = (levels = []) => levels.filter((l) => (l.quantity ?? l[1] ?? 0) >= minContracts);
-  return { ticker, yesWhales: flagLevels(data.orderbook?.yes), noWhales: flagLevels(data.orderbook?.no) };
+  const book = data.orderbook_fp || {};
+  const topLevels = (levels = []) => levels
+    .map((l) => ({ price: parseFloat(l[0]), size: parseFloat(l[1]) }))
+    .filter((l) => Number.isFinite(l.price) && Number.isFinite(l.size))
+    .sort((a, b) => b.size - a.size)
+    .slice(0, topN);
+  return { ticker, yesWhales: topLevels(book.yes_dollars), noWhales: topLevels(book.no_dollars) };
 }
 
 // ---------- SPORTS LIVE DATA ----------
@@ -255,7 +328,7 @@ app.post("/api/guardrails/check", (req, res) => {
   res.json(g.checkEntry(proposedStake));
 });
 app.get("/api/whales/:ticker", async (req, res) => {
-  try { res.json(await detectWhales(req.params.ticker, { minContracts: Number(req.query.min) || 500 })); }
+  try { res.json(await detectWhales(req.params.ticker, { topN: Number(req.query.top) || 3 })); }
   catch (err) { res.status(502).json({ error: err.message }); }
 });
 app.get("/api/sports/live-markets/:seriesTicker", async (req, res) => {
@@ -298,14 +371,25 @@ h1 { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 3r
 .countdown { display: block; margin-top: 6px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #a98a95; letter-spacing: 0.05em; }
 .reasons { margin: 10px 0 0; padding-left: 16px; font-size: 11px; color: #a98a95; line-height: 1.6; }
 .reasons li { margin-bottom: 2px; }
+.sparkline { display: block; margin-top: 10px; }
+.data-stale { display: block; margin-top: 6px; font-size: 9px; text-transform: uppercase; letter-spacing: 0.1em; color: #d97757; }
+.whale-watch { margin-top: 14px; padding-top: 10px; border-top: 1px solid rgba(201,161,90,0.15); }
+.whale-label { font-size: 9px; text-transform: uppercase; letter-spacing: 0.12em; color: #8a6b74; margin-bottom: 4px; }
+.whale-line { font-family: 'JetBrains Mono', monospace; font-size: 11px; }
+.whale-yes { color: #c9a15a; }
+.whale-no { color: #c98ba0; }
 .position { margin-top: 12px; padding: 6px 10px; border-radius: 3px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600; }
 .position-yes { background: rgba(201,161,90,0.15); color: #c9a15a; border: 1px solid rgba(201,161,90,0.4); }
 .position-no { background: rgba(201,139,160,0.15); color: #c98ba0; border: 1px solid rgba(201,139,160,0.4); }
 .position-settling { opacity: 0.6; border-style: dashed; }
+.position-stale { background: rgba(217,119,87,0.15); color: #d97757; border: 1px solid rgba(217,119,87,0.4); }
 .position-actions { display: flex; gap: 6px; margin-top: 8px; }
 .position-actions button { flex: 1; background: #1a0f13; border: 1px solid rgba(201,161,90,0.3); color: #f5ead9; padding: 6px 8px; border-radius: 3px; font-family: 'Work Sans', sans-serif; font-size: 11px; cursor: pointer; }
 .position-actions button:hover { border-color: #c9a15a; }
-.volatility-warning { margin-top: 8px; padding: 6px 10px; border-radius: 3px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; background: rgba(217,119,87,0.15); color: #d97757; border: 1px solid rgba(217,119,87,0.4); }
+.exit-advice { margin-top: 8px; padding: 6px 10px; border-radius: 3px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
+.exit-locked-in { background: rgba(201,161,90,0.15); color: #c9a15a; border: 1px solid rgba(201,161,90,0.4); }
+.exit-exit-warning { background: rgba(217,119,87,0.15); color: #d97757; border: 1px solid rgba(217,119,87,0.4); }
+.exit-hold-wide-gap { background: rgba(138,107,116,0.15); color: #a98a95; border: 1px solid rgba(138,107,116,0.4); }
 .stats { display: flex; justify-content: space-between; margin-top: 14px; font-family: 'JetBrains Mono', monospace; font-size: 13px; color: #f5ead9; }
 .stat-label { color: #8a6b74; font-size: 9px; text-transform: uppercase; display: block; }
 h2 { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 2rem; margin: 40px 0 8px; }
@@ -317,6 +401,11 @@ h2 { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 2r
 .log-form select, .log-form button { background: #1a0f13; border: 1px solid rgba(201,161,90,0.3); color: #f5ead9; padding: 8px 12px; border-radius: 3px; font-family: 'Work Sans', sans-serif; font-size: 13px; }
 .log-form button { cursor: pointer; }
 .log-form button:hover { border-color: #c9a15a; }
+.guardrails-label { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #a98a95; }
+.guardrails-label input { width: 80px; background: #1a0f13; border: 1px solid rgba(201,161,90,0.3); color: #f5ead9; padding: 8px 10px; border-radius: 3px; font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+.guardrails-status { margin-top: 4px; padding: 12px 16px; border-radius: 4px; font-size: 13px; border: 1px solid rgba(201,161,90,0.25); color: #a98a95; }
+.guardrails-ok { border-color: rgba(201,161,90,0.4); color: #c9a15a; }
+.guardrails-blocked { border-color: rgba(217,119,87,0.4); color: #d97757; background: rgba(217,119,87,0.06); }
 table { width: 100%; border-collapse: collapse; font-family: 'JetBrains Mono', monospace; font-size: 13px; }
 th { text-align: left; color: #8a6b74; font-size: 10px; text-transform: uppercase; letter-spacing: 0.15em; padding: 8px 0; border-bottom: 1px solid rgba(201,161,90,0.15); }
 td { padding: 8px 0; border-bottom: 1px solid rgba(201,161,90,0.08); }
@@ -348,6 +437,15 @@ footer { margin-top: 32px; font-size: 10px; text-transform: uppercase; letter-sp
     <tbody id="logBody"></tbody>
   </table>
 
+  <h2>Risk Guardrails</h2>
+  <div class="log-desc">Set your bankroll and a typical stake once - this checks your real logged trades against simple stop rules (daily loss limit, cooldown after a losing streak), not vibes.</div>
+  <div class="log-form">
+    <label class="guardrails-label">Bankroll $<input type="number" id="bankrollInput" min="1" step="1" value="1000"></label>
+    <label class="guardrails-label">Stake per trade $<input type="number" id="stakeInput" min="1" step="1" value="50"></label>
+    <button onclick="saveGuardrailSettings()">Save</button>
+  </div>
+  <div id="guardrailsStatus" class="guardrails-status">Set your bankroll and stake, then save to see guardrail status.</div>
+
   <footer>Educational tooling - not financial advice - signals are probabilistic, never certain</footer>
 </div>
 <script>
@@ -361,10 +459,19 @@ function saveLog(log) { localStorage.setItem('tradeLog', JSON.stringify(log)); }
 function currentPosition(symbol) {
   return getLog().find(t => t.symbol === symbol && t.result === 'pending') || null;
 }
-function enterPosition(symbol, signal, ticker, closeTime) {
+// Safety net: a pending position with no ticker (entered before auto-settle
+// existed) or one whose settlement lookup keeps failing can never resolve
+// on its own - flag it well past any single 15-min cycle so it's obvious
+// you need to close it yourself, instead of silently looking "still open"
+// forever.
+const STALE_MS = 30 * 60 * 1000;
+function isStale(pos) {
+  return !!(pos && pos.time && (Date.now() - new Date(pos.time).getTime()) > STALE_MS);
+}
+function enterPosition(symbol, signal, ticker, closeTime, payout) {
   if (currentPosition(symbol)) return; // one open position per symbol at a time
   const log = getLog();
-  log.unshift({ symbol, signal, result: 'pending', time: new Date().toLocaleString(), ticker: ticker || null, closeTime: closeTime || null });
+  log.unshift({ symbol, signal, result: 'pending', time: new Date().toLocaleString(), ticker: ticker || null, closeTime: closeTime || null, payout: payout || null });
   saveLog(log);
   refresh();
   renderLog();
@@ -409,13 +516,52 @@ function logTrade() {
   enterPosition(symbol, signal);
 }
 
+// Small inline chart of the last ~5 minutes of spot price against the
+// strike (dashed line) - no charting library, just an SVG polyline built
+// from the same rolling window the server already tracks.
+function sparklineSvg(history, strike) {
+  if (!history || history.length < 2) return '';
+  const w = 160, h = 36, pad = 3;
+  const all = strike != null ? history.concat([strike]) : history.slice();
+  let min = Math.min.apply(null, all);
+  let max = Math.max.apply(null, all);
+  if (max === min) { max += 1; min -= 1; }
+  const xStep = (w - pad * 2) / (history.length - 1);
+  const yFor = v => h - pad - ((v - min) / (max - min)) * (h - pad * 2);
+  const points = history.map((v, i) => (pad + i * xStep).toFixed(1) + ',' + yFor(v).toFixed(1)).join(' ');
+  const strikeLine = strike != null
+    ? '<line x1="' + pad + '" y1="' + yFor(strike).toFixed(1) + '" x2="' + (w - pad) + '" y2="' + yFor(strike).toFixed(1) + '" stroke="#c98ba0" stroke-width="1" stroke-dasharray="3,3" />'
+    : '';
+  return '<svg class="sparkline" width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '">' +
+    strikeLine +
+    '<polyline points="' + points + '" fill="none" stroke="#c9a15a" stroke-width="1.5" />' +
+  '</svg>';
+}
+
+async function fetchWhales(ticker) {
+  try {
+    const res = await fetch('/api/whales/' + encodeURIComponent(ticker) + '?top=2');
+    return await res.json();
+  } catch (e) { return null; }
+}
+function whaleWatchHtml(whales) {
+  if (!whales || ((!whales.yesWhales || !whales.yesWhales.length) && (!whales.noWhales || !whales.noWhales.length))) return '';
+  const line = (w, side) => '<div class="whale-line whale-' + side + '">' + side.toUpperCase() + ' ' + Math.round(w.size).toLocaleString() + ' @ ' + (w.price * 100).toFixed(1) + '¢</div>';
+  const yes = (whales.yesWhales || []).map(w => line(w, 'yes')).join('');
+  const no = (whales.noWhales || []).map(w => line(w, 'no')).join('');
+  return '<div class="whale-watch"><div class="whale-label">Whale Watch - largest resting orders</div>' + yes + no + '</div>';
+}
+
 async function refresh() {
   try {
     const res = await fetch('/api/live-status');
     const data = await res.json();
+    const entries = Object.values(data);
+    const whaleResults = await Promise.all(entries.map(m => m.ticker ? fetchWhales(m.ticker) : Promise.resolve(null)));
     const el = document.getElementById('markets');
-    el.innerHTML = Object.values(data).map(m => {
+    el.innerHTML = entries.map((m, idx) => {
       if (m.error) return '<div class="card"><div class="symbol">' + m.symbol + '</div><div class="label">Error: ' + m.error + '</div></div>';
+      const whaleHtml = whaleWatchHtml(whaleResults[idx]);
       const isPaper = m.mode === 'paper-only';
       const hasSignal = m.signal && m.signal !== 'PAPER_ONLY';
       const signalClass = m.signal === 'HOLD' ? 'hold' : (isPaper && hasSignal ? 'unvalidated' : '');
@@ -429,40 +575,51 @@ async function refresh() {
       const reasonsHtml = (m.reasons && m.reasons.length)
         ? '<ul class="reasons">' + m.reasons.map(r => '<li>' + r + '</li>').join('') + '</ul>'
         : '';
+      const sparklineHtml = sparklineSvg(m.sparkline, m.strike);
+      const dataStale = (Date.now() - m.updatedAt) > 60000;
+      const staleDataHtml = dataStale
+        ? '<div class="data-stale">Data may be stale - last updated ' + Math.round((Date.now() - m.updatedAt) / 1000) + 's ago</div>'
+        : '';
       const pos = currentPosition(m.symbol);
       const cycleEnded = !!(pos && pos.closeTime && new Date(pos.closeTime).getTime() <= Date.now());
-      const volatilityWarning = (pos && m.highVolatility && !cycleEnded)
-        ? '<div class="volatility-warning">Volatility spike - consider taking profit</div>'
+      const stale = isStale(pos);
+      const exitHtml = (pos && !cycleEnded && !stale && m.exitAdvice && m.exitAdvice !== 'NEUTRAL')
+        ? '<div class="exit-advice exit-' + m.exitAdvice.toLowerCase().replace(/_/g,'-') + '">' + m.exitReason + '</div>'
         : '';
-      const positionLabel = cycleEnded
-        ? 'Settling...'
-        : (pos && pos.signal === 'BUY_YES' ? 'HOLDING UP (YES) ▲' : 'HOLDING DOWN (NO) ▼');
+      const positionLabel = stale
+        ? 'Stale - no contract match, close manually below'
+        : cycleEnded
+          ? 'Settling...'
+          : (pos && pos.signal === 'BUY_YES' ? 'HOLDING UP (YES) ▲' : 'HOLDING DOWN (NO) ▼');
       const posHtml = pos
-        ? '<div class="position position-' + (pos.signal === 'BUY_YES' ? 'yes' : 'no') + (cycleEnded ? ' position-settling' : '') + '">' +
+        ? '<div class="position position-' + (pos.signal === 'BUY_YES' ? 'yes' : 'no') + (cycleEnded ? ' position-settling' : '') + (stale ? ' position-stale' : '') + '">' +
             'Your position: ' + positionLabel +
           '</div>' +
-          volatilityWarning +
+          exitHtml +
           '<div class="position-actions">' +
             '<button onclick="closePosition(\\'' + m.symbol + '\\',\\'win\\')">Won</button>' +
             '<button onclick="closePosition(\\'' + m.symbol + '\\',\\'loss\\')">Lost</button>' +
           '</div>'
         : '<div class="position-actions">' +
-            '<button onclick="enterPosition(\\'' + m.symbol + '\\',\\'BUY_YES\\',\\'' + (m.ticker||'') + '\\',\\'' + (m.closeTime||'') + '\\')">Enter YES</button>' +
-            '<button onclick="enterPosition(\\'' + m.symbol + '\\',\\'BUY_NO\\',\\'' + (m.ticker||'') + '\\',\\'' + (m.closeTime||'') + '\\')">Enter NO</button>' +
+            '<button onclick="enterPosition(\\'' + m.symbol + '\\',\\'BUY_YES\\',\\'' + (m.ticker||'') + '\\',\\'' + (m.closeTime||'') + '\\',' + (m.payout||1) + ')">Enter YES</button>' +
+            '<button onclick="enterPosition(\\'' + m.symbol + '\\',\\'BUY_NO\\',\\'' + (m.ticker||'') + '\\',\\'' + (m.closeTime||'') + '\\',' + (m.payout||1) + ')">Enter NO</button>' +
           '</div>';
       return '<div class="card ' + (isPaper ? 'paper' : '') + '">' +
         '<div class="symbol">' + m.symbol + '</div>' +
         '<div class="signal ' + signalClass + '">' + signalText + '</div>' +
         leanHtml +
         countdownHtml +
+        staleDataHtml +
         (isPaper && hasSignal ? '<div class="unvalidated-note">Unvalidated backtest - not live-tradeable</div>' : '') +
         reasonsHtml +
+        sparklineHtml +
         posHtml +
         '<div class="stats">' +
           '<div><span class="stat-label">Price</span>$' + Number(m.spotPrice).toFixed(m.spotPrice < 1 ? 4 : 2) + '</div>' +
           '<div><span class="stat-label">Prob</span>' + (m.impliedProb*100).toFixed(0) + '%</div>' +
           '<div><span class="stat-label">Payout</span>' + m.payout.toFixed(2) + 'x</div>' +
         '</div>' +
+        whaleHtml +
       '</div>';
     }).join('');
     updateCountdowns();
@@ -511,6 +668,68 @@ function renderLog() {
   ).join('');
 }
 renderLog();
+
+// --- Risk guardrails (localStorage, per-browser) ---
+// Reuses the backend's existing Guardrails class/route - this just feeds
+// it real numbers derived from your actual logged trades (settled results
+// + the payout recorded at entry) instead of asking you to track it by hand.
+function getGuardrailSettings() {
+  return JSON.parse(localStorage.getItem('guardrailSettings') || '{"bankroll":1000,"stake":50}');
+}
+function saveGuardrailSettings() {
+  const bankroll = parseFloat(document.getElementById('bankrollInput').value) || 1000;
+  const stake = parseFloat(document.getElementById('stakeInput').value) || 50;
+  localStorage.setItem('guardrailSettings', JSON.stringify({ bankroll, stake }));
+  refreshGuardrails();
+}
+function computeConsecutiveLosses(log) {
+  let count = 0;
+  for (const entry of log) {
+    if (entry.result === 'pending') continue;
+    if (entry.result === 'loss') { count++; continue; }
+    break;
+  }
+  return count;
+}
+function computeDailyPnl(log, stake) {
+  const today = new Date().toDateString();
+  let pnl = 0;
+  for (const entry of log) {
+    if (entry.result !== 'win' && entry.result !== 'loss') continue;
+    if (new Date(entry.time).toDateString() !== today) continue;
+    pnl += entry.result === 'win' ? stake * ((entry.payout || 1.2) - 1) : -stake;
+  }
+  return pnl;
+}
+async function refreshGuardrails() {
+  const settings = getGuardrailSettings();
+  const bankrollEl = document.getElementById('bankrollInput');
+  const stakeEl = document.getElementById('stakeInput');
+  if (bankrollEl && document.activeElement !== bankrollEl) bankrollEl.value = settings.bankroll;
+  if (stakeEl && document.activeElement !== stakeEl) stakeEl.value = settings.stake;
+  const log = getLog();
+  const consecutiveLosses = computeConsecutiveLosses(log);
+  const dailyPnl = computeDailyPnl(log, settings.stake);
+  try {
+    const res = await fetch('/api/guardrails/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bankroll: settings.bankroll, dailyPnl, consecutiveLosses, proposedStake: settings.stake })
+    });
+    const data = await res.json();
+    const el = document.getElementById('guardrailsStatus');
+    const summary = 'Today\\'s P/L: $' + dailyPnl.toFixed(2) + ' - Consecutive losses: ' + consecutiveLosses;
+    if (data.allowed) {
+      el.className = 'guardrails-status guardrails-ok';
+      el.innerHTML = 'OK to trade at $' + settings.stake + ' stake. ' + summary;
+    } else {
+      el.className = 'guardrails-status guardrails-blocked';
+      el.innerHTML = data.reasons.join(' ') + ' ' + summary;
+    }
+  } catch (e) { console.error(e); }
+}
+refreshGuardrails();
+setInterval(refreshGuardrails, 20000);
 </script>
 </body>
 </html>`);
